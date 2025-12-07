@@ -96,6 +96,318 @@ static Value tostringNative(int argCount, Value* args) {
     return OBJ_VAL(copyString("<object>", 8));
 }
 
+/* ========== Module System ========== */
+
+/* Track loaded modules to avoid re-loading */
+static Table loadedModules;
+static bool modulesInitialized = false;
+
+/* Read file contents */
+static char* readFile(const char* path) {
+    FILE* file = fopen(path, "rb");
+    if (file == NULL) return NULL;
+    
+    fseek(file, 0L, SEEK_END);
+    size_t fileSize = ftell(file);
+    rewind(file);
+    
+    char* buffer = (char*)malloc(fileSize + 1);
+    if (buffer == NULL) {
+        fclose(file);
+        return NULL;
+    }
+    
+    size_t bytesRead = fread(buffer, sizeof(char), fileSize, file);
+    buffer[bytesRead] = '\0';
+    fclose(file);
+    return buffer;
+}
+
+/*
+ * require(moduleName) - Load and execute a Lua++ module
+ * 
+ * Searches for moduleName.luapp in:
+ * 1. Current directory
+ * 2. ./lib/ directory
+ * 3. Standard library path
+ * 
+ * Returns the module's exports table.
+ */
+static Value requireNative(int argCount, Value* args) {
+    if (argCount != 1 || !IS_STRING(args[0])) {
+        return NIL_VAL;
+    }
+    
+    ObjString* moduleName = AS_STRING(args[0]);
+    
+    /* Initialize module cache if needed */
+    if (!modulesInitialized) {
+        initTable(&loadedModules);
+        modulesInitialized = true;
+    }
+    
+    /* Check if already loaded */
+    Value cached;
+    if (tableGet(&loadedModules, moduleName, &cached)) {
+        return cached;
+    }
+    
+    /* Try to find the module file */
+    char path[512];
+    char* source = NULL;
+    
+    /* Try: moduleName.luapp */
+    snprintf(path, sizeof(path), "%s.luapp", moduleName->chars);
+    source = readFile(path);
+    
+    /* Try: lib/moduleName.luapp */
+    if (source == NULL) {
+        snprintf(path, sizeof(path), "lib/%s.luapp", moduleName->chars);
+        source = readFile(path);
+    }
+    
+    /* Try: stdlib/moduleName.luapp */
+    if (source == NULL) {
+        snprintf(path, sizeof(path), "stdlib/%s.luapp", moduleName->chars);
+        source = readFile(path);
+    }
+    
+    if (source == NULL) {
+        fprintf(stderr, "Module not found: %s\n", moduleName->chars);
+        return NIL_VAL;
+    }
+    
+    /* Create a table to hold module exports */
+    ObjTable* exports = newTable();
+    push(OBJ_VAL(exports));  /* GC protection */
+    
+    /* Store in cache before loading (handles circular deps) */
+    tableSet(&loadedModules, moduleName, OBJ_VAL(exports));
+    
+    /* Save current globals state */
+    /* The module will define its exports as globals, we'll capture them */
+    
+    /* Compile and run the module */
+    ObjFunction* function = compileWithFilename(source, path);
+    free(source);
+    
+    if (function == NULL) {
+        pop();  /* Remove exports from stack */
+        tableDelete(&loadedModules, moduleName);
+        return NIL_VAL;
+    }
+    
+    /* Run the module */
+    push(OBJ_VAL(function));
+    ObjClosure* closure = newClosure(function);
+    pop();
+    push(OBJ_VAL(closure));
+    
+    /* Module will run via run() which handles frame management */
+    
+    if (vm.frameCount == FRAMES_MAX) {
+        pop();
+        pop();
+        return NIL_VAL;
+    }
+    
+    CallFrame* frame = &vm.frames[vm.frameCount++];
+    frame->closure = closure;
+    frame->ip = closure->function->chunk.code;
+    frame->slots = vm.stackTop - 1;
+    
+    /* Run until module completes */
+    InterpretResult result = run();
+    
+    if (result != INTERPRET_OK) {
+        pop();  /* Remove exports */
+        return NIL_VAL;
+    }
+    
+    /* Module executed - exports table is ready */
+    pop();  /* Remove closure */
+    Value exportsVal = pop();  /* Get exports */
+    
+    return exportsVal;
+}
+
+/* ========== Iterator Functions for for-in loops ========== */
+
+/*
+ * pairs(table) - Returns iterator function, table, nil
+ * Used in: for k, v in pairs(t) do ... end
+ */
+static Value pairsNative(int argCount, Value* args) {
+    if (argCount != 1 || !IS_TABLE(args[0])) {
+        return NIL_VAL;
+    }
+    /* Return the table itself - the VM handles iteration */
+    return args[0];
+}
+
+/*
+ * ipairs(table) - Returns iterator for array part
+ * Used in: for i, v in ipairs(t) do ... end
+ */
+static Value ipairsNative(int argCount, Value* args) {
+    if (argCount != 1 || !IS_TABLE(args[0])) {
+        return NIL_VAL;
+    }
+    return args[0];
+}
+
+/*
+ * next(table, key) - Returns next key-value pair
+ * If key is nil, returns first pair.
+ */
+static Value nextNative(int argCount, Value* args) {
+    if (argCount < 1 || !IS_TABLE(args[0])) {
+        return NIL_VAL;
+    }
+    
+    ObjTable* table = AS_TABLE(args[0]);
+    Value key = (argCount > 1) ? args[1] : NIL_VAL;
+    
+    /* If key is nil, return first element */
+    if (IS_NIL(key)) {
+        /* Check array part first */
+        if (table->array.count > 0) {
+            /* Return key=1, value=array[0] as a table {1, value} */
+            ObjTable* result = newTable();
+            writeValueArray(&result->array, NUMBER_VAL(1));
+            writeValueArray(&result->array, table->array.values[0]);
+            return OBJ_VAL(result);
+        }
+        /* Check hash part */
+        for (int i = 0; i < table->entries.capacity; i++) {
+            Entry* entry = &table->entries.entries[i];
+            if (entry->key != NULL) {
+                ObjTable* result = newTable();
+                writeValueArray(&result->array, OBJ_VAL(entry->key));
+                writeValueArray(&result->array, entry->value);
+                return OBJ_VAL(result);
+            }
+        }
+        return NIL_VAL;
+    }
+    
+    /* Find next after given key */
+    if (IS_NUMBER(key)) {
+        int idx = (int)AS_NUMBER(key);
+        if (idx >= 1 && idx < table->array.count) {
+            ObjTable* result = newTable();
+            writeValueArray(&result->array, NUMBER_VAL(idx + 1));
+            writeValueArray(&result->array, table->array.values[idx]);
+            return OBJ_VAL(result);
+        }
+        /* Fall through to hash part */
+    }
+    
+    /* Search hash part */
+    bool found = false;
+    for (int i = 0; i < table->entries.capacity; i++) {
+        Entry* entry = &table->entries.entries[i];
+        if (entry->key != NULL) {
+            if (found) {
+                ObjTable* result = newTable();
+                writeValueArray(&result->array, OBJ_VAL(entry->key));
+                writeValueArray(&result->array, entry->value);
+                return OBJ_VAL(result);
+            }
+            if (IS_STRING(key) && entry->key == AS_STRING(key)) {
+                found = true;
+            }
+        }
+    }
+    
+    return NIL_VAL;
+}
+
+/*
+ * error(message) - Raise a runtime error
+ */
+static Value errorNative(int argCount, Value* args) {
+    if (argCount >= 1 && IS_STRING(args[0])) {
+        fprintf(stderr, "error: %s\n", AS_CSTRING(args[0]));
+    } else {
+        fprintf(stderr, "error\n");
+    }
+    return NIL_VAL;
+}
+
+/*
+ * assert(condition, message) - Assert condition is true
+ */
+static Value assertNative(int argCount, Value* args) {
+    if (argCount < 1) return NIL_VAL;
+    
+    bool condition = !IS_NIL(args[0]) && !(IS_BOOL(args[0]) && !AS_BOOL(args[0]));
+    
+    if (!condition) {
+        if (argCount >= 2 && IS_STRING(args[1])) {
+            fprintf(stderr, "assertion failed: %s\n", AS_CSTRING(args[1]));
+        } else {
+            fprintf(stderr, "assertion failed\n");
+        }
+    }
+    
+    return args[0];
+}
+
+/*
+ * rawget(table, key) - Get without metamethods
+ */
+static Value rawgetNative(int argCount, Value* args) {
+    if (argCount != 2 || !IS_TABLE(args[0])) return NIL_VAL;
+    
+    ObjTable* table = AS_TABLE(args[0]);
+    Value key = args[1];
+    
+    if (IS_NUMBER(key)) {
+        int idx = (int)AS_NUMBER(key);
+        if (idx >= 1 && idx <= table->array.count) {
+            return table->array.values[idx - 1];
+        }
+    }
+    
+    if (IS_STRING(key)) {
+        Value value;
+        if (tableGet(&table->entries, AS_STRING(key), &value)) {
+            return value;
+        }
+    }
+    
+    return NIL_VAL;
+}
+
+/*
+ * rawset(table, key, value) - Set without metamethods
+ */
+static Value rawsetNative(int argCount, Value* args) {
+    if (argCount != 3 || !IS_TABLE(args[0])) return NIL_VAL;
+    
+    ObjTable* table = AS_TABLE(args[0]);
+    Value key = args[1];
+    Value value = args[2];
+    
+    if (IS_NUMBER(key)) {
+        int idx = (int)AS_NUMBER(key);
+        if (idx >= 1) {
+            while (table->array.count < idx) {
+                writeValueArray(&table->array, NIL_VAL);
+            }
+            table->array.values[idx - 1] = value;
+            return args[0];
+        }
+    }
+    
+    if (IS_STRING(key)) {
+        tableSet(&table->entries, AS_STRING(key), value);
+    }
+    
+    return args[0];
+}
+
 static void defineNative(const char* name, NativeFn function) {
     push(OBJ_VAL(copyString(name, (int)strlen(name))));
     push(OBJ_VAL(newNative(function, AS_STRING(vm.stack[0]))));
@@ -134,6 +446,22 @@ void initVM(void) {
     defineNative("type", typeNative);
     defineNative("tonumber", tonumberNative);
     defineNative("tostring", tostringNative);
+    
+    // Module system
+    defineNative("require", requireNative);
+    
+    // Iterators
+    defineNative("pairs", pairsNative);
+    defineNative("ipairs", ipairsNative);
+    defineNative("next", nextNative);
+    
+    // Error handling
+    defineNative("error", errorNative);
+    defineNative("assert", assertNative);
+    
+    // Raw table access
+    defineNative("rawget", rawgetNative);
+    defineNative("rawset", rawsetNative);
 }
 
 void freeVM(void) {

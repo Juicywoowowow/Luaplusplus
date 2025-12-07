@@ -1,0 +1,128 @@
+-- Lua++ Standard Library: String
+-- Pure Lua++ implementation of string functions
+
+local string = {}
+
+-- Get string length
+function string.len(s)
+    return #s
+end
+
+-- Get substring: string.sub(s, i, j)
+-- i and j are 1-indexed, j defaults to -1 (end of string)
+function string.sub(s, i, j)
+    local len = #s
+    
+    -- Handle negative indices
+    if i < 0 then
+        i = len + i + 1
+    end
+    if j == nil then
+        j = len
+    elseif j < 0 then
+        j = len + j + 1
+    end
+    
+    -- Clamp to valid range
+    if i < 1 then i = 1 end
+    if j > len then j = len end
+    if i > j then return "" end
+    
+    -- Build result character by character
+    -- Note: This is inefficient but works without native support
+    local result = ""
+    local idx = 1
+    for c in s do
+        if idx >= i and idx <= j then
+            result = result .. c
+        end
+        idx = idx + 1
+        if idx > j then break end
+    end
+    return result
+end
+
+-- Convert to uppercase
+function string.upper(s)
+    local result = ""
+    for i = 1, #s do
+        local c = string.byte(s, i)
+        if c >= 97 and c <= 122 then  -- a-z
+            result = result .. string.char(c - 32)
+        else
+            result = result .. string.char(c)
+        end
+    end
+    return result
+end
+
+-- Convert to lowercase
+function string.lower(s)
+    local result = ""
+    for i = 1, #s do
+        local c = string.byte(s, i)
+        if c >= 65 and c <= 90 then  -- A-Z
+            result = result .. string.char(c + 32)
+        else
+            result = result .. string.char(c)
+        end
+    end
+    return result
+end
+
+-- Repeat string n times
+function string.rep(s, n)
+    local result = ""
+    for i = 1, n do
+        result = result .. s
+    end
+    return result
+end
+
+-- Reverse string
+function string.reverse(s)
+    local result = ""
+    for i = #s, 1, -1 do
+        result = result .. string.sub(s, i, i)
+    end
+    return result
+end
+
+-- Check if string starts with prefix
+function string.startswith(s, prefix)
+    if #prefix > #s then return false end
+    return string.sub(s, 1, #prefix) == prefix
+end
+
+-- Check if string ends with suffix
+function string.endswith(s, suffix)
+    if #suffix > #s then return false end
+    return string.sub(s, #s - #suffix + 1) == suffix
+end
+
+-- Trim whitespace from both ends
+function string.trim(s)
+    -- Find first non-space
+    local start = 1
+    while start <= #s do
+        local c = string.sub(s, start, start)
+        if c ~= " " and c ~= "\t" and c ~= "\n" and c ~= "\r" then
+            break
+        end
+        start = start + 1
+    end
+    
+    -- Find last non-space
+    local finish = #s
+    while finish >= start do
+        local c = string.sub(s, finish, finish)
+        if c ~= " " and c ~= "\t" and c ~= "\n" and c ~= "\r" then
+            break
+        end
+        finish = finish - 1
+    end
+    
+    return string.sub(s, start, finish)
+end
+
+return string

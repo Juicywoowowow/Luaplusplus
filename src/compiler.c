@@ -1346,7 +1346,9 @@ static void ifStatement(void) {
     int thenJump = emitJump(OP_JUMP_IF_FALSE);
     emitByte(OP_POP);
     
+    beginScope();
     block();
+    endScope();
     
     int elseJump = emitJump(OP_JUMP);
     patchJump(thenJump);
@@ -1360,7 +1362,9 @@ static void ifStatement(void) {
         int nextJump = emitJump(OP_JUMP_IF_FALSE);
         emitByte(OP_POP);
         
+        beginScope();
         block();
+        endScope();
         
         int skipJump = emitJump(OP_JUMP);
         patchJump(elseJump);
@@ -1371,7 +1375,9 @@ static void ifStatement(void) {
     }
     
     if (match(TOKEN_ELSE)) {
+        beginScope();
         block();
+        endScope();
     }
     
     patchJump(elseJump);
@@ -1395,7 +1401,9 @@ static void whileStatement(void) {
     int exitJump = emitJump(OP_JUMP_IF_FALSE);
     emitByte(OP_POP);
     
+    beginScope();
     block();
+    endScope();
     
     emitLoop(loopStart);
     
@@ -1422,10 +1430,12 @@ static void repeatStatement(void) {
     loop.continueTarget = loopStart;  // Continue jumps back to start of body
     current->currentLoop = &loop;
     
+    beginScope();
     block();
     
     consume(TOKEN_UNTIL, "Expect 'until' after repeat body.");
     expression();
+    endScope();  // Note: scope ends after 'until' expression so locals are visible in condition
     
     int exitJump = emitJump(OP_JUMP_IF_FALSE);
     emitByte(OP_POP);
@@ -1442,15 +1452,13 @@ static void repeatStatement(void) {
     current->currentLoop = loop.enclosing;
 }
 
-static void forStatement(void) {
-    beginScope();
-    
-    // Parse loop variable
-    uint8_t var = parseVariable("Expect variable name.");
-    
-    consume(TOKEN_EQUAL, "Expect '=' after for variable.");
+/*
+ * Numeric for loop: for i = start, end, step do ... end
+ * Note: The loop variable has already been added as a local by forStatement
+ */
+static void forNumericStatement(void) {
     expression();  // Start value
-    defineVariable(var);
+    markInitialized();  // Mark the loop variable as initialized
     
     // Add hidden locals for limit and step
     addLocal((Token){.start = "", .length = 0});  // limit
@@ -1471,6 +1479,17 @@ static void forStatement(void) {
     
     consume(TOKEN_DO, "Expect 'do' after for clause.");
     
+    /*
+     * IMPORTANT: Save slot indices NOW, before block() which may add/remove locals.
+     * The for loop variables are at fixed positions:
+     * - varSlot: the loop counter (i)
+     * - limitSlot: the end value
+     * - stepSlot: the increment
+     */
+    int varSlot = current->localCount - 3;
+    int limitSlot = current->localCount - 2;
+    int stepSlot = current->localCount - 1;
+    
     Loop loop;
     loop.enclosing = current->currentLoop;
     loop.scopeDepth = current->scopeDepth;
@@ -1480,8 +1499,8 @@ static void forStatement(void) {
     loop.start = loopStart;
     
     // Check: var <= limit (simplified, doesn't handle negative step)
-    emitBytes(OP_GET_LOCAL, (uint8_t)(current->localCount - 3));  // var
-    emitBytes(OP_GET_LOCAL, (uint8_t)(current->localCount - 2));  // end
+    emitBytes(OP_GET_LOCAL, (uint8_t)varSlot);
+    emitBytes(OP_GET_LOCAL, (uint8_t)limitSlot);
     emitByte(OP_GREATER);
     emitByte(OP_NOT);
     
@@ -1490,16 +1509,18 @@ static void forStatement(void) {
     
     current->currentLoop = &loop;
     
+    beginScope();
     block();
+    endScope();
     
-    // Continue target is the increment section (set after block so continue jumps here)
+    // Continue target is the increment section
     loop.continueTarget = currentChunk()->count;
     
     // Increment: var = var + step
-    emitBytes(OP_GET_LOCAL, (uint8_t)(current->localCount - 3));  // var
-    emitBytes(OP_GET_LOCAL, (uint8_t)(current->localCount - 1));  // step
+    emitBytes(OP_GET_LOCAL, (uint8_t)varSlot);
+    emitBytes(OP_GET_LOCAL, (uint8_t)stepSlot);
     emitByte(OP_ADD);
-    emitBytes(OP_SET_LOCAL, (uint8_t)(current->localCount - 3));
+    emitBytes(OP_SET_LOCAL, (uint8_t)varSlot);
     emitByte(OP_POP);
     
     emitLoop(loopStart);
@@ -1514,6 +1535,154 @@ static void forStatement(void) {
     
     current->currentLoop = loop.enclosing;
     consume(TOKEN_END, "Expect 'end' after for body.");
+}
+
+/*
+ * Generic for loop: for k, v in pairs(t) do ... end
+ * or: for i, v in ipairs(t) do ... end
+ * 
+ * Compiles to:
+ *   local _iter = pairs(t)  -- iterator state (the table)
+ *   local _idx = 0          -- current index (for ipairs) or nil (for pairs)
+ *   while true do
+ *     local _result = next(_iter, _idx)
+ *     if _result == nil then break end
+ *     local k = _result[1]
+ *     local v = _result[2]
+ *     _idx = k
+ *     ... body ...
+ *   end
+ */
+static void forInStatement(Token firstName) {
+    // First variable already parsed, declare it
+    addLocal(firstName);
+    markInitialized();
+    emitByte(OP_NIL);  // Placeholder, will be set in loop
+    int keySlot = current->localCount - 1;
+    
+    // Check for second variable (value)
+    int valueSlot = -1;
+    if (match(TOKEN_COMMA)) {
+        consume(TOKEN_IDENTIFIER, "Expect variable name after ','.");
+        addLocal(parser.previous);
+        markInitialized();
+        emitByte(OP_NIL);  // Placeholder
+        valueSlot = current->localCount - 1;
+    }
+    
+    consume(TOKEN_IN, "Expect 'in' after for variables.");
+    
+    // Parse the iterator expression (e.g., pairs(t) or ipairs(t))
+    // This should return a table to iterate over
+    expression();
+    
+    // Store iterator state in hidden local
+    addLocal((Token){.start = "_iter", .length = 5});
+    markInitialized();
+    int iterSlot = current->localCount - 1;
+    
+    // Index tracker (starts at 0 for array iteration)
+    addLocal((Token){.start = "_idx", .length = 4});
+    markInitialized();
+    emitConstant(NUMBER_VAL(0));
+    int idxSlot = current->localCount - 1;
+    
+    consume(TOKEN_DO, "Expect 'do' after for clause.");
+    
+    Loop loop;
+    loop.enclosing = current->currentLoop;
+    loop.scopeDepth = current->scopeDepth;
+    loop.breakCount = 0;
+    
+    int loopStart = currentChunk()->count;
+    loop.start = loopStart;
+    loop.continueTarget = loopStart;
+    current->currentLoop = &loop;
+    
+    /*
+     * Loop body:
+     * 1. Get iterator table
+     * 2. Get current index
+     * 3. Check if index < #table (for array iteration)
+     * 4. If not, exit loop
+     * 5. Increment index
+     * 6. Get key and value
+     * 7. Execute body
+     * 8. Loop back
+     */
+    
+    // Get table length
+    emitBytes(OP_GET_LOCAL, (uint8_t)iterSlot);
+    emitByte(OP_LENGTH);
+    
+    // Get current index
+    emitBytes(OP_GET_LOCAL, (uint8_t)idxSlot);
+    
+    // Check: idx < length
+    emitByte(OP_LESS);
+    
+    int exitJump = emitJump(OP_JUMP_IF_FALSE);
+    emitByte(OP_POP);
+    
+    // Increment index: idx = idx + 1
+    emitBytes(OP_GET_LOCAL, (uint8_t)idxSlot);
+    emitConstant(NUMBER_VAL(1));
+    emitByte(OP_ADD);
+    emitBytes(OP_SET_LOCAL, (uint8_t)idxSlot);
+    emitByte(OP_POP);
+    
+    // Set key = current index (1-based for Lua)
+    emitBytes(OP_GET_LOCAL, (uint8_t)idxSlot);
+    emitBytes(OP_SET_LOCAL, (uint8_t)keySlot);
+    emitByte(OP_POP);
+    
+    // Set value = table[idx]
+    if (valueSlot >= 0) {
+        emitBytes(OP_GET_LOCAL, (uint8_t)iterSlot);
+        emitBytes(OP_GET_LOCAL, (uint8_t)idxSlot);
+        emitByte(OP_TABLE_GET);
+        emitBytes(OP_SET_LOCAL, (uint8_t)valueSlot);
+        emitByte(OP_POP);
+    }
+    
+    // Execute loop body
+    beginScope();
+    block();
+    endScope();
+    
+    emitLoop(loopStart);
+    
+    patchJump(exitJump);
+    emitByte(OP_POP);
+    
+    // Patch all break jumps
+    for (int i = 0; i < loop.breakCount; i++) {
+        patchJump(loop.breakJumps[i]);
+    }
+    
+    current->currentLoop = loop.enclosing;
+    consume(TOKEN_END, "Expect 'end' after for body.");
+}
+
+static void forStatement(void) {
+    beginScope();
+    
+    // Parse first variable name
+    consume(TOKEN_IDENTIFIER, "Expect variable name.");
+    Token firstName = parser.previous;
+    
+    // Check if this is numeric for (=) or generic for (in or ,)
+    if (match(TOKEN_EQUAL)) {
+        // Numeric for: for i = start, end, step do
+        // Declare the loop variable with the saved name
+        addLocal(firstName);
+        forNumericStatement();
+    } else {
+        // Generic for: for k, v in expr do
+        // or: for k in expr do
+        forInStatement(firstName);
+    }
+    
     endScope();
 }
 

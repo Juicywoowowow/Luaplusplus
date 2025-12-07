@@ -1,0 +1,85 @@
+-- Bubble Sort Example
+-- Demonstrates: tables, for loops, functions, and the table stdlib
+
+-- Import table library (once module system works)
+-- local table = require("table")
+
+-- Bubble sort implementation
+function bubbleSort(arr)
+    local n = #arr
+    local swapped = true
+    
+    while swapped do
+        swapped = false
+        for i = 1, n - 1 do
+            if arr[i] > arr[i + 1] then
+                -- Swap elements
+                local temp = arr[i]
+                arr[i] = arr[i + 1]
+                arr[i + 1] = temp
+                swapped = true
+            end
+        end
+        n = n - 1  -- Last element is now in place
+    end
+    
+    return arr
+end
+
+-- Helper to print array
+function printArray(arr, label)
+    local result = label .. ": ["
+    for i = 1, #arr do
+        result = result .. tostring(arr[i])
+        if i < #arr then
+            result = result .. ", "
+        end
+    end
+    result = result .. "]"
+    print(result)
+end
+
+-- Main program
+print("=== Bubble Sort Demo ===")
+print("")
+
+-- Test with numbers
+local numbers = {64, 34, 25, 12, 22, 11, 90}
+printArray(numbers, "Before")
+bubbleSort(numbers)
+printArray(numbers, "After ")
+
+print("")
+
+-- Test with already sorted
+local sorted = {1, 2, 3, 4, 5}
+printArray(sorted, "Already sorted")
+bubbleSort(sorted)
+printArray(sorted, "After sort    ")
+
+print("")
+
+-- Test with reverse sorted
+local reversed = {5, 4, 3, 2, 1}
+printArray(reversed, "Reverse sorted")
+bubbleSort(reversed)
+printArray(reversed, "After sort    ")
+
+print("")
+
+-- Test with single element
+local single = {42}
+printArray(single, "Single element")
+bubbleSort(single)
+printArray(single, "After sort    ")
+
+print("")
+
+-- Test with duplicates
+local dupes = {3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5}
+printArray(dupes, "With duplicates")
+bubbleSort(dupes)
+printArray(dupes, "After sort     ")
+
+print("")
+print("=== Done! ===")
