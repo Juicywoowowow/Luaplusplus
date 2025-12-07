@@ -1052,6 +1052,231 @@ bool callClosure(ObjClosure* closure, int argCount, Value* args, Value* result) 
                 break;
             }
             
+            /* ========== Upvalues and Closures ========== */
+            
+            case OP_GET_UPVALUE: {
+                uint8_t slot = CC_READ_BYTE();
+                push(*frame->closure->upvalues[slot]->location);
+                break;
+            }
+            
+            case OP_SET_UPVALUE: {
+                uint8_t slot = CC_READ_BYTE();
+                *frame->closure->upvalues[slot]->location = peek(0);
+                break;
+            }
+            
+            case OP_CLOSE_UPVALUE: {
+                closeUpvalues(vm.stackTop - 1);
+                pop();
+                break;
+            }
+            
+            case OP_CLOSURE: {
+                ObjFunction* function = AS_FUNCTION(CC_READ_CONSTANT());
+                ObjClosure* closure = newClosure(function);
+                push(OBJ_VAL(closure));
+                for (int i = 0; i < closure->upvalueCount; i++) {
+                    uint8_t isLocal = CC_READ_BYTE();
+                    uint8_t index = CC_READ_BYTE();
+                    if (isLocal) {
+                        closure->upvalues[i] = captureUpvalue(frame->slots + index);
+                    } else {
+                        closure->upvalues[i] = frame->closure->upvalues[index];
+                    }
+                }
+                break;
+            }
+            
+            /* ========== Global Variables ========== */
+            
+            case OP_SET_GLOBAL: {
+                ObjString* name = CC_READ_STRING();
+                if (tableSet(&vm.globals, name, peek(0))) {
+                    tableDelete(&vm.globals, name);
+                    CC_FAIL();
+                }
+                break;
+            }
+            
+            case OP_DEFINE_GLOBAL: {
+                ObjString* name = CC_READ_STRING();
+                tableSet(&vm.globals, name, peek(0));
+                pop();
+                break;
+            }
+            
+            /* ========== OOP Operations ========== */
+            
+            case OP_GET_PROPERTY: {
+                if (!IS_INSTANCE(peek(0))) CC_FAIL();
+                ObjInstance* instance = AS_INSTANCE(peek(0));
+                ObjString* name = CC_READ_STRING();
+                
+                Value value;
+                if (tableGet(&instance->fields, name, &value)) {
+                    pop();
+                    push(value);
+                    break;
+                }
+                
+                if (!bindMethod(instance->klass, name)) {
+                    CC_FAIL();
+                }
+                break;
+            }
+            
+            case OP_SET_PROPERTY: {
+                if (!IS_INSTANCE(peek(1))) CC_FAIL();
+                ObjInstance* instance = AS_INSTANCE(peek(1));
+                tableSet(&instance->fields, CC_READ_STRING(), peek(0));
+                Value value = pop();
+                pop();
+                push(value);
+                break;
+            }
+            
+            case OP_INVOKE: {
+                ObjString* method = CC_READ_STRING();
+                int invokeArgCount = CC_READ_BYTE();
+                if (!invoke(method, invokeArgCount)) {
+                    CC_FAIL();
+                }
+                frame = &vm.frames[vm.frameCount - 1];
+                break;
+            }
+            
+            case OP_NEW: {
+                int newArgCount = CC_READ_BYTE();
+                Value klassVal = peek(newArgCount);
+                
+                if (!IS_CLASS(klassVal)) CC_FAIL();
+                
+                ObjInstance* instance = newInstance(AS_CLASS(klassVal));
+                vm.stackTop[-newArgCount - 1] = OBJ_VAL(instance);
+                
+                Value initializer;
+                if (tableGet(&AS_CLASS(klassVal)->methods, vm.initString, &initializer)) {
+                    if (!call(AS_CLOSURE(initializer), newArgCount)) {
+                        CC_FAIL();
+                    }
+                    frame = &vm.frames[vm.frameCount - 1];
+                } else if (newArgCount != 0) {
+                    CC_FAIL();
+                }
+                break;
+            }
+            
+            /* ========== Table Operations ========== */
+            
+            case OP_TABLE: {
+                push(OBJ_VAL(newTable()));
+                break;
+            }
+            
+            case OP_TABLE_GET: {
+                Value key = pop();
+                Value tableVal = pop();
+                
+                if (!IS_TABLE(tableVal)) CC_FAIL();
+                
+                ObjTable* table = AS_TABLE(tableVal);
+                
+                if (IS_NUMBER(key)) {
+                    int index = (int)AS_NUMBER(key);
+                    if (index >= 1 && index <= table->array.count) {
+                        push(table->array.values[index - 1]);
+                        break;
+                    }
+                }
+                
+                if (IS_STRING(key)) {
+                    Value value;
+                    if (tableGet(&table->entries, AS_STRING(key), &value)) {
+                        push(value);
+                        break;
+                    }
+                }
+                
+                push(NIL_VAL);
+                break;
+            }
+            
+            case OP_TABLE_SET: {
+                Value value = pop();
+                Value key = pop();
+                Value tableVal = pop();
+                
+                if (!IS_TABLE(tableVal)) CC_FAIL();
+                
+                ObjTable* table = AS_TABLE(tableVal);
+                
+                if (IS_NUMBER(key)) {
+                    int index = (int)AS_NUMBER(key);
+                    if (index >= 1) {
+                        while (table->array.count < index) {
+                            writeValueArray(&table->array, NIL_VAL);
+                        }
+                        table->array.values[index - 1] = value;
+                        push(value);
+                        break;
+                    }
+                }
+                
+                if (IS_STRING(key)) {
+                    tableSet(&table->entries, AS_STRING(key), value);
+                    push(value);
+                    break;
+                }
+                
+                CC_FAIL();
+            }
+            
+            case OP_TABLE_ADD: {
+                Value value = pop();
+                Value tableVal = peek(0);
+                
+                if (!IS_TABLE(tableVal)) CC_FAIL();
+                
+                ObjTable* table = AS_TABLE(tableVal);
+                writeValueArray(&table->array, value);
+                break;
+            }
+            
+            case OP_TABLE_SET_FIELD: {
+                ObjString* name = CC_READ_STRING();
+                Value value = pop();
+                Value tableVal = peek(0);
+                
+                if (!IS_TABLE(tableVal)) CC_FAIL();
+                
+                ObjTable* table = AS_TABLE(tableVal);
+                tableSet(&table->entries, name, value);
+                break;
+            }
+            
+            /* ========== Additional Operations ========== */
+            
+            case OP_MODULO: {
+                if (!IS_NUMBER(peek(0)) || !IS_NUMBER(peek(1))) CC_FAIL();
+                double b = AS_NUMBER(pop());
+                double a = AS_NUMBER(pop());
+                push(NUMBER_VAL((int)a % (int)b));
+                break;
+            }
+            
+            case OP_LENGTH: {
+                Value val = pop();
+                if (IS_STRING(val)) {
+                    push(NUMBER_VAL(AS_STRING(val)->length));
+                } else if (IS_TABLE(val)) {
+                    push(NUMBER_VAL(AS_TABLE(val)->array.count));
+                } else {
+                    CC_FAIL();
+                }
+                break;
+            }
+            
             default:
                 /* Unhandled opcode in mini-interpreter */
                 CC_FAIL();

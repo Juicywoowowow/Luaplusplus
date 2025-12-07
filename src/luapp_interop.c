@@ -8,6 +8,12 @@
  *   local luapp = require("luapp")
  *   local result = luapp.eval("return 1 + 2")
  *   local mod = luapp.load("mymodule.luapp")
+ *   
+ *   -- Instantiate Lua++ classes
+ *   local obj = luapp.new(mod.MyClass, arg1, arg2)
+ *   
+ *   -- Pass Lua functions to Lua++
+ *   mod.callback = function(x) return x * 2 end
  */
 
 #include "luapp_interop.h"
@@ -25,12 +31,16 @@ DebugFlags debugFlags = {false, false, false};
 /* Track if Lua++ VM is initialized */
 static bool vmInitialized = false;
 
+/* Global Lua state for reverse calls (Lua++ calling Lua) */
+static lua_State* globalLuaState = NULL;
+
 /* Forward declarations */
 static void tableToLua(lua_State* L, ObjTable* table);
 static void classToLua(lua_State* L, ObjClass* klass);
 static void instanceToLua(lua_State* L, ObjInstance* instance);
 static void closureToLua(lua_State* L, ObjClosure* closure);
 static Value tableFromLua(lua_State* L, int idx);
+static Value functionFromLua(lua_State* L, int idx);
 
 /* ========== Lua++ Value → Lua ========== */
 
@@ -258,8 +268,7 @@ Value luaToLuapp(lua_State* L, int idx) {
             return tableFromLua(L, idx);
             
         case LUA_TFUNCTION:
-            /* TODO: Wrap Lua functions as Lua++ natives */
-            return NIL_VAL;
+            return functionFromLua(L, idx);
             
         case LUA_TUSERDATA:
         case LUA_TLIGHTUSERDATA:
@@ -269,6 +278,125 @@ Value luaToLuapp(lua_State* L, int idx) {
         default:
             return NIL_VAL;
     }
+}
+
+/* ========== Lua Function Wrapper (Reverse Direction) ========== */
+
+/*
+ * Structure to hold Lua function reference for calling from Lua++.
+ * We store the Lua registry reference so the function isn't garbage collected.
+ */
+typedef struct {
+    lua_State* L;       /* Lua state */
+    int ref;            /* Registry reference to the Lua function */
+} LuaFuncRef;
+
+/* Array to track Lua function references */
+#define MAX_LUA_FUNC_REFS 256
+static LuaFuncRef luaFuncRefs[MAX_LUA_FUNC_REFS];
+static int luaFuncRefCount = 0;
+
+/*
+ * Native function that calls a Lua function from Lua++.
+ * The function reference index is encoded in the native's name.
+ */
+static Value luaFunctionNative(int argCount, Value* args) {
+    if (globalLuaState == NULL) {
+        return NIL_VAL;
+    }
+    
+    lua_State* L = globalLuaState;
+    
+    /* Get the function reference from the native's context */
+    /* We use a simple approach: store ref index in a global */
+    /* This is set before calling the native */
+    extern int currentLuaFuncRef;
+    
+    if (currentLuaFuncRef < 0 || currentLuaFuncRef >= luaFuncRefCount) {
+        return NIL_VAL;
+    }
+    
+    LuaFuncRef* funcRef = &luaFuncRefs[currentLuaFuncRef];
+    
+    /* Push the Lua function from registry */
+    lua_rawgeti(L, LUA_REGISTRYINDEX, funcRef->ref);
+    
+    /* Push arguments */
+    for (int i = 0; i < argCount; i++) {
+        luappToLua(L, args[i]);
+    }
+    
+    /* Call the Lua function */
+    if (lua_pcall(L, argCount, 1, 0) != LUA_OK) {
+        /* Error occurred */
+        lua_pop(L, 1);  /* Pop error message */
+        return NIL_VAL;
+    }
+    
+    /* Convert result back to Lua++ */
+    Value result = luaToLuapp(L, -1);
+    lua_pop(L, 1);
+    
+    return result;
+}
+
+/* Current Lua function reference being called (for native dispatch) */
+int currentLuaFuncRef = -1;
+
+/*
+ * Wrapper native that dispatches to the correct Lua function.
+ * Each wrapped Lua function gets a unique native with its ref index.
+ */
+static Value luaFuncWrapper0(int argCount, Value* args) { currentLuaFuncRef = 0; return luaFunctionNative(argCount, args); }
+static Value luaFuncWrapper1(int argCount, Value* args) { currentLuaFuncRef = 1; return luaFunctionNative(argCount, args); }
+static Value luaFuncWrapper2(int argCount, Value* args) { currentLuaFuncRef = 2; return luaFunctionNative(argCount, args); }
+static Value luaFuncWrapper3(int argCount, Value* args) { currentLuaFuncRef = 3; return luaFunctionNative(argCount, args); }
+static Value luaFuncWrapper4(int argCount, Value* args) { currentLuaFuncRef = 4; return luaFunctionNative(argCount, args); }
+static Value luaFuncWrapper5(int argCount, Value* args) { currentLuaFuncRef = 5; return luaFunctionNative(argCount, args); }
+static Value luaFuncWrapper6(int argCount, Value* args) { currentLuaFuncRef = 6; return luaFunctionNative(argCount, args); }
+static Value luaFuncWrapper7(int argCount, Value* args) { currentLuaFuncRef = 7; return luaFunctionNative(argCount, args); }
+
+static NativeFn luaFuncWrappers[] = {
+    luaFuncWrapper0, luaFuncWrapper1, luaFuncWrapper2, luaFuncWrapper3,
+    luaFuncWrapper4, luaFuncWrapper5, luaFuncWrapper6, luaFuncWrapper7,
+};
+#define NUM_LUA_FUNC_WRAPPERS (sizeof(luaFuncWrappers) / sizeof(luaFuncWrappers[0]))
+
+/*
+ * Convert a Lua function to a Lua++ native function.
+ * This allows Lua++ code to call Lua functions.
+ */
+static Value functionFromLua(lua_State* L, int idx) {
+    if (luaFuncRefCount >= MAX_LUA_FUNC_REFS || 
+        luaFuncRefCount >= (int)NUM_LUA_FUNC_WRAPPERS) {
+        /* Too many Lua functions wrapped */
+        return NIL_VAL;
+    }
+    
+    /* Store the Lua state for reverse calls */
+    globalLuaState = L;
+    
+    /* Create a reference to the Lua function in the registry */
+    lua_pushvalue(L, idx);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    
+    /* Store the reference */
+    int refIndex = luaFuncRefCount++;
+    luaFuncRefs[refIndex].L = L;
+    luaFuncRefs[refIndex].ref = ref;
+    
+    /* Create a Lua++ native function that wraps this Lua function */
+    ObjString* name = copyString("<lua function>", 14);
+    ObjNative* native = newNative(luaFuncWrappers[refIndex], name);
+    
+    return OBJ_VAL(native);
+}
+
+/*
+ * Public API: Wrap a Lua function for use in Lua++.
+ */
+Value wrapLuaFunction(lua_State* L, int idx) {
+    return functionFromLua(L, idx);
 }
 
 /*
@@ -425,7 +553,114 @@ static int l_reset(lua_State* L) {
         freeVM();
         initVM();
     }
+    /* Reset Lua function references */
+    for (int i = 0; i < luaFuncRefCount; i++) {
+        luaL_unref(luaFuncRefs[i].L, LUA_REGISTRYINDEX, luaFuncRefs[i].ref);
+    }
+    luaFuncRefCount = 0;
     return 0;
+}
+
+/*
+ * luapp.new(class, ...) - Instantiate a Lua++ class from Lua
+ * 
+ * Usage:
+ *   local mod = luapp.load("mymodule.luapp")
+ *   local obj = luapp.new(mod.MyClass, arg1, arg2)
+ * 
+ * This is equivalent to: new MyClass(arg1, arg2) in Lua++
+ */
+int luappNewInstance(lua_State* L) {
+    /* First argument must be a class (table with __luapp_class) */
+    if (!lua_istable(L, 1)) {
+        return luaL_error(L, "First argument must be a Lua++ class");
+    }
+    
+    /* Get the __luapp_class field */
+    lua_getfield(L, 1, "__luapp_class");
+    if (!lua_islightuserdata(L, -1)) {
+        lua_pop(L, 1);
+        return luaL_error(L, "Invalid Lua++ class (missing __luapp_class)");
+    }
+    
+    ObjClass* klass = (ObjClass*)lua_touserdata(L, -1);
+    lua_pop(L, 1);
+    
+    if (klass == NULL) {
+        return luaL_error(L, "Invalid Lua++ class (null pointer)");
+    }
+    
+    /* Create a new instance */
+    ObjInstance* instance = newInstance(klass);
+    push(OBJ_VAL(instance));  /* GC protection */
+    
+    /* Get argument count (excluding the class itself) */
+    int argCount = lua_gettop(L) - 1;
+    
+    /* Look for init method */
+    Value initializer;
+    if (tableGet(&klass->methods, vm.initString, &initializer)) {
+        /* Convert Lua arguments to Lua++ values */
+        Value* args = NULL;
+        if (argCount > 0) {
+            args = (Value*)malloc(sizeof(Value) * argCount);
+            if (args == NULL) {
+                pop();  /* Remove GC protection */
+                return luaL_error(L, "Out of memory");
+            }
+            for (int i = 0; i < argCount; i++) {
+                args[i] = luaToLuapp(L, i + 2);  /* Skip class at index 1 */
+            }
+        }
+        
+        /* Set up the call: push instance as 'self', then args */
+        push(OBJ_VAL(instance));  /* self */
+        for (int i = 0; i < argCount; i++) {
+            push(args[i]);
+        }
+        
+        /* Call the initializer */
+        ObjClosure* initClosure = AS_CLOSURE(initializer);
+        Value result;
+        bool success = callClosure(initClosure, argCount, args, &result);
+        
+        if (args != NULL) {
+            free(args);
+        }
+        
+        if (!success) {
+            pop();  /* Remove GC protection */
+            return luaL_error(L, "Lua++ constructor failed");
+        }
+    } else if (argCount > 0) {
+        pop();  /* Remove GC protection */
+        return luaL_error(L, "Class has no init method but %d arguments provided", argCount);
+    }
+    
+    /* Convert instance to Lua and return */
+    pop();  /* Remove GC protection */
+    instanceToLua(L, instance);
+    return 1;
+}
+
+/*
+ * luapp.call(func, ...) - Call a Lua++ function from Lua
+ * 
+ * This is useful when you have a Lua++ closure and want to call it
+ * with explicit control over arguments.
+ */
+static int l_call(lua_State* L) {
+    /* First argument should be a Lua++ closure (wrapped as C closure) */
+    if (!lua_isfunction(L, 1)) {
+        return luaL_error(L, "First argument must be a function");
+    }
+    
+    /* Get argument count (excluding the function itself) */
+    int argCount = lua_gettop(L) - 1;
+    
+    /* Move function to position 1 and call it with remaining args */
+    lua_call(L, argCount, 1);
+    return 1;
 }
 
 /* ========== Module Registration ========== */
@@ -433,12 +668,17 @@ static int l_reset(lua_State* L) {
 static const luaL_Reg luapp_funcs[] = {
     {"eval",    l_eval},
     {"load",    l_load},
+    {"new",     luappNewInstance},
+    {"call",    l_call},
     {"version", l_version},
     {"reset",   l_reset},
     {NULL, NULL}
 };
 
 int luaopen_luapp(lua_State* L) {
+    /* Store global Lua state for reverse calls (Lua++ calling Lua) */
+    globalLuaState = L;
+    
     /* Initialize Lua++ VM */
     if (!vmInitialized) {
         initVM();
