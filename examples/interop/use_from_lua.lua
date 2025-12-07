@@ -38,17 +38,13 @@ for k, v in pairs(mod) do
 end
 print()
 
--- Test exported constant getters
-print("Constants (via getter functions):")
-print("  getPI:", type(mod.getPI))
-print("  getVersion:", type(mod.getVersion))
-print()
-
--- Test functions (note: calling Lua++ functions from Lua is limited)
-print("Functions exported:")
-print("  greet:", type(mod.greet))
-print("  add:", type(mod.add))
-print("  factorial:", type(mod.factorial))
+-- Test calling Lua++ functions from Lua!
+print("Calling Lua++ functions:")
+print(string.format("  add(5, 3) = %s", mod.add(5, 3)))
+print(string.format("  greet('Lua') = %s", mod.greet("Lua")))
+print(string.format("  factorial(6) = %s", mod.factorial(6)))
+print(string.format("  getPI() = %s", mod.getPI()))
+print(string.format("  getVersion() = %s", mod.getVersion()))
 print()
 
 -- Show class structure

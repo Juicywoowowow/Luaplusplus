@@ -189,6 +189,32 @@ class Counter
 end
 ```
 
+## Lua Interop
+
+Lua++ can be used as a shared library from standard Lua:
+
+```bash
+# Build the shared library
+make lib
+```
+
+```lua
+-- From standard Lua
+local luapp = require("luapp")
+
+-- Load a Lua++ module
+local mod = luapp.load("mymodule.luapp")
+
+-- Call Lua++ functions
+print(mod.add(5, 3))        -- 8
+print(mod.greet("World"))   -- Hello, World!
+
+-- Access exported classes
+print(mod.MyClass)          -- table with methods
+```
+
+See `examples/interop/` for complete examples.
+
 ## Examples
 
 See the `examples/` directory:
@@ -197,25 +223,26 @@ See the `examples/` directory:
 - `new_features.luapp` - Tables, break, continue, traits
 - `constant_folding.luapp` - Compiler optimizations
 - `error_showcase.luapp` - Diagnostic system demo
+- `interop/` - Lua ↔ Lua++ interoperability examples
 
 ## Architecture
 
 ```
 src/
-├── main.c        - CLI entry point
-├── lexer.c       - Tokenizer
-├── compiler.c    - Pratt parser + bytecode emission + constant folding
-├── vm.c          - Bytecode interpreter
-├── object.c      - Heap objects (strings, functions, classes, tables, traits)
-├── memory.c      - Allocator + mark-sweep GC
-├── table.c       - Hash table implementation
-├── chunk.c       - Bytecode container
-├── value.c       - Tagged union values
-├── debug.c       - Bytecode disassembler
-└── diagnostic.c  - Error/warning reporting with source context
+├── main.c           - CLI entry point
+├── lexer.c          - Tokenizer
+├── compiler.c       - Pratt parser + bytecode emission + constant folding
+├── vm.c             - Bytecode interpreter
+├── object.c         - Heap objects (strings, functions, classes, tables, traits)
+├── memory.c         - Allocator + mark-sweep GC
+├── table.c          - Hash table implementation
+├── chunk.c          - Bytecode container
+├── value.c          - Tagged union values
+├── debug.c          - Bytecode disassembler
+├── diagnostic.c     - Error/warning reporting with source context
+└── luapp_interop.c  - Lua ↔ Lua++ interoperability layer
 ```
 
 ## License
 
 MIT
-# Lua-

@@ -863,9 +863,8 @@ bool callClosure(ObjClosure* closure, int argCount, Value* args, Value* result) 
         return false;
     }
     
-    /* Save current VM state */
-    int savedFrameCount = vm.frameCount;
-    Value* savedStackTop = vm.stackTop;
+    /* Save the frame count - we'll run until we return to this level */
+    int baseFrameCount = vm.frameCount;
     
     /* Push the closure as the callee */
     push(OBJ_VAL(closure));
@@ -877,31 +876,191 @@ bool callClosure(ObjClosure* closure, int argCount, Value* args, Value* result) 
     
     /* Set up call frame */
     if (!call(closure, argCount)) {
-        /* Restore state on failure */
-        vm.stackTop = savedStackTop;
-        vm.frameCount = savedFrameCount;
+        /* Pop the closure and args on failure */
+        vm.stackTop -= argCount + 1;
         if (result) *result = NIL_VAL;
         return false;
     }
     
-    /* Run until we return to our frame */
-    InterpretResult runResult = run();
-    
-    if (runResult != INTERPRET_OK) {
-        /* Runtime error occurred */
-        if (result) *result = NIL_VAL;
-        return false;
-    }
-    
-    /* Get the result from the stack */
-    if (result) {
-        /* After return, result should be on top of stack */
-        if (vm.stackTop > savedStackTop) {
-            *result = *(vm.stackTop - 1);
-        } else {
-            *result = NIL_VAL;
+    /* Run the VM - it will execute until OP_RETURN brings frameCount back */
+    CallFrame* frame = &vm.frames[vm.frameCount - 1];
+
+/* Local macros for bytecode reading */
+#define CC_READ_BYTE() (*frame->ip++)
+#define CC_READ_SHORT() \
+    (frame->ip += 2, (uint16_t)((frame->ip[-2] << 8) | frame->ip[-1]))
+#define CC_READ_CONSTANT() \
+    (frame->closure->function->chunk.constants.values[CC_READ_BYTE()])
+#define CC_READ_STRING() AS_STRING(CC_READ_CONSTANT())
+#define CC_FAIL() do { if (result) *result = NIL_VAL; return false; } while(0)
+
+    for (;;) {
+        uint8_t instruction = CC_READ_BYTE();
+        
+        switch (instruction) {
+            case OP_RETURN: {
+                Value returnValue = pop();
+                closeUpvalues(frame->slots);
+                vm.frameCount--;
+                
+                if (vm.frameCount <= baseFrameCount) {
+                    /* We've returned from the called function */
+                    vm.stackTop = frame->slots;
+                    if (result) *result = returnValue;
+                    return true;
+                }
+                
+                vm.stackTop = frame->slots;
+                push(returnValue);
+                frame = &vm.frames[vm.frameCount - 1];
+                break;
+            }
+            
+            case OP_CONSTANT: {
+                Value constant = CC_READ_CONSTANT();
+                push(constant);
+                break;
+            }
+            case OP_NIL:   push(NIL_VAL); break;
+            case OP_TRUE:  push(BOOL_VAL(true)); break;
+            case OP_FALSE: push(BOOL_VAL(false)); break;
+            case OP_POP:   pop(); break;
+            
+            case OP_GET_LOCAL: {
+                uint8_t slot = CC_READ_BYTE();
+                push(frame->slots[slot]);
+                break;
+            }
+            case OP_SET_LOCAL: {
+                uint8_t slot = CC_READ_BYTE();
+                frame->slots[slot] = peek(0);
+                break;
+            }
+            case OP_GET_GLOBAL: {
+                ObjString* name = CC_READ_STRING();
+                Value value;
+                if (!tableGet(&vm.globals, name, &value)) {
+                    CC_FAIL();
+                }
+                push(value);
+                break;
+            }
+            
+            case OP_ADD: {
+                if (!IS_NUMBER(peek(0)) || !IS_NUMBER(peek(1))) CC_FAIL();
+                double b = AS_NUMBER(pop());
+                double a = AS_NUMBER(pop());
+                push(NUMBER_VAL(a + b));
+                break;
+            }
+            case OP_SUBTRACT: {
+                if (!IS_NUMBER(peek(0)) || !IS_NUMBER(peek(1))) CC_FAIL();
+                double b = AS_NUMBER(pop());
+                double a = AS_NUMBER(pop());
+                push(NUMBER_VAL(a - b));
+                break;
+            }
+            case OP_MULTIPLY: {
+                if (!IS_NUMBER(peek(0)) || !IS_NUMBER(peek(1))) CC_FAIL();
+                double b = AS_NUMBER(pop());
+                double a = AS_NUMBER(pop());
+                push(NUMBER_VAL(a * b));
+                break;
+            }
+            case OP_DIVIDE: {
+                if (!IS_NUMBER(peek(0)) || !IS_NUMBER(peek(1))) CC_FAIL();
+                double b = AS_NUMBER(pop());
+                double a = AS_NUMBER(pop());
+                push(NUMBER_VAL(a / b));
+                break;
+            }
+            case OP_NEGATE: {
+                if (!IS_NUMBER(peek(0))) CC_FAIL();
+                push(NUMBER_VAL(-AS_NUMBER(pop())));
+                break;
+            }
+            case OP_NOT: {
+                push(BOOL_VAL(isFalsey(pop())));
+                break;
+            }
+            
+            case OP_LESS: {
+                if (!IS_NUMBER(peek(0)) || !IS_NUMBER(peek(1))) CC_FAIL();
+                double b = AS_NUMBER(pop());
+                double a = AS_NUMBER(pop());
+                push(BOOL_VAL(a < b));
+                break;
+            }
+            case OP_GREATER: {
+                if (!IS_NUMBER(peek(0)) || !IS_NUMBER(peek(1))) CC_FAIL();
+                double b = AS_NUMBER(pop());
+                double a = AS_NUMBER(pop());
+                push(BOOL_VAL(a > b));
+                break;
+            }
+            case OP_EQUAL: {
+                Value b = pop();
+                Value a = pop();
+                push(BOOL_VAL(valuesEqual(a, b)));
+                break;
+            }
+            
+            case OP_JUMP: {
+                uint16_t offset = CC_READ_SHORT();
+                frame->ip += offset;
+                break;
+            }
+            case OP_JUMP_IF_FALSE: {
+                uint16_t offset = CC_READ_SHORT();
+                if (isFalsey(peek(0))) frame->ip += offset;
+                break;
+            }
+            case OP_LOOP: {
+                uint16_t offset = CC_READ_SHORT();
+                frame->ip -= offset;
+                break;
+            }
+            
+            case OP_CALL: {
+                int callArgCount = CC_READ_BYTE();
+                if (!callValue(peek(callArgCount), callArgCount)) {
+                    CC_FAIL();
+                }
+                frame = &vm.frames[vm.frameCount - 1];
+                break;
+            }
+            
+            case OP_CONCAT: {
+                if (!IS_STRING(peek(0)) || !IS_STRING(peek(1))) CC_FAIL();
+                ObjString* b = AS_STRING(peek(0));
+                ObjString* a = AS_STRING(peek(1));
+                int length = a->length + b->length;
+                char* chars = ALLOCATE(char, length + 1);
+                memcpy(chars, a->chars, a->length);
+                memcpy(chars + a->length, b->chars, b->length);
+                chars[length] = '\0';
+                ObjString* str = takeString(chars, length);
+                pop();
+                pop();
+                push(OBJ_VAL(str));
+                break;
+            }
+            
+            case OP_POPN: {
+                uint8_t n = CC_READ_BYTE();
+                vm.stackTop -= n;
+                break;
+            }
+            
+            default:
+                /* Unhandled opcode in mini-interpreter */
+                CC_FAIL();
         }
     }
-    
-    return true;
+
+#undef CC_READ_BYTE
+#undef CC_READ_SHORT
+#undef CC_READ_CONSTANT
+#undef CC_READ_STRING
+#undef CC_FAIL
 }
