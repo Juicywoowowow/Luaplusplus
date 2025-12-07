@@ -1,0 +1,41 @@
+-- simple_module.luapp
+-- A simple Lua++ module for interop testing
+
+function greet(name)
+    return "Hello, " .. name .. "!"
+end
+
+function add(a, b)
+    return a + b
+end
+
+function factorial(n)
+    if n <= 1 then
+        return 1
+    end
+    return n * factorial(n - 1)
+end
+
+-- A simple class
+class Counter
+    function init()
+        self.value = 0
+    end
+    
+    function increment()
+        self.value = self.value + 1
+    end
+    
+    function get()
+        return self.value
+    end
+end
+
+-- Export constants via functions (workaround for global assignment)
+function getPI()
+    return 3.14159
+end
+
+function getVersion()
+    return "1.0.0"
+end

@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/alexanderbrianttadiosa/TERMUX TOOLS/luaOOP/lua-plus-plus/tests/build/_deps/googletest-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

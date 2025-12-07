@@ -1,0 +1,16 @@
+-- Test file for error diagnostics
+
+-- Unused variable warning
+local unused_var = 42
+
+-- This should work fine
+local used_var = 10
+print(tostring(used_var))
+
+-- Syntax error: unexpected character
+local bad@ = 5
+
+-- Another error
+function test()
+    return 1
+end

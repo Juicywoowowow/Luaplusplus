@@ -1,0 +1,5 @@
+if(EXISTS "/Users/alexanderbrianttadiosa/TERMUX TOOLS/luaOOP/lua-plus-plus/tests/build/luapp_tests[1]_tests.cmake")
+  include("/Users/alexanderbrianttadiosa/TERMUX TOOLS/luaOOP/lua-plus-plus/tests/build/luapp_tests[1]_tests.cmake")
+else()
+  add_test(luapp_tests_NOT_BUILT luapp_tests_NOT_BUILT)
+endif()

@@ -1,0 +1,2 @@
+/usr/bin/ar qc libluapp_test_main.a CMakeFiles/luapp_test_main.dir/test_main.cpp.o
+/usr/bin/ranlib libluapp_test_main.a

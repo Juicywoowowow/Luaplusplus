@@ -1,0 +1,456 @@
+/*
+ * luapp_interop.c - Lua ↔ Lua++ interoperability layer
+ * 
+ * This module allows standard Lua to load and execute Lua++ code,
+ * marshalling values between the two runtimes.
+ * 
+ * Usage from Lua:
+ *   local luapp = require("luapp")
+ *   local result = luapp.eval("return 1 + 2")
+ *   local mod = luapp.load("mymodule.luapp")
+ */
+
+#include "luapp_interop.h"
+#include "vm.h"
+#include "compiler.h"
+#include "memory.h"
+#include "common.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Define debugFlags since main.c is not included in the shared library */
+DebugFlags debugFlags = {false, false, false};
+
+/* Track if Lua++ VM is initialized */
+static bool vmInitialized = false;
+
+/* Forward declarations */
+static void tableToLua(lua_State* L, ObjTable* table);
+static void classToLua(lua_State* L, ObjClass* klass);
+static void instanceToLua(lua_State* L, ObjInstance* instance);
+static void closureToLua(lua_State* L, ObjClosure* closure);
+static Value tableFromLua(lua_State* L, int idx);
+
+/* ========== Lua++ Value → Lua ========== */
+
+void luappToLua(lua_State* L, Value val) {
+    if (IS_NIL(val)) {
+        lua_pushnil(L);
+    }
+    else if (IS_BOOL(val)) {
+        lua_pushboolean(L, AS_BOOL(val));
+    }
+    else if (IS_NUMBER(val)) {
+        lua_pushnumber(L, AS_NUMBER(val));
+    }
+    else if (IS_STRING(val)) {
+        ObjString* str = AS_STRING(val);
+        lua_pushlstring(L, str->chars, str->length);
+    }
+    else if (IS_TABLE(val)) {
+        tableToLua(L, AS_TABLE(val));
+    }
+    else if (IS_CLASS(val)) {
+        classToLua(L, AS_CLASS(val));
+    }
+    else if (IS_INSTANCE(val)) {
+        instanceToLua(L, AS_INSTANCE(val));
+    }
+    else if (IS_CLOSURE(val)) {
+        closureToLua(L, AS_CLOSURE(val));
+    }
+    else if (IS_FUNCTION(val)) {
+        /* Raw functions shouldn't appear at runtime, but handle anyway */
+        lua_pushnil(L);
+    }
+    else if (IS_NATIVE(val)) {
+        /* Native functions - push as nil for now */
+        lua_pushnil(L);
+    }
+    else {
+        lua_pushnil(L);
+    }
+}
+
+/*
+ * Convert Lua++ table to Lua table.
+ * Handles both array and hash parts.
+ */
+static void tableToLua(lua_State* L, ObjTable* table) {
+    lua_newtable(L);
+    
+    /* Array part (1-indexed) */
+    for (int i = 0; i < table->array.count; i++) {
+        lua_pushinteger(L, i + 1);
+        luappToLua(L, table->array.values[i]);
+        lua_settable(L, -3);
+    }
+    
+    /* Hash part */
+    for (int i = 0; i < table->entries.capacity; i++) {
+        Entry* entry = &table->entries.entries[i];
+        if (entry->key != NULL) {
+            lua_pushlstring(L, entry->key->chars, entry->key->length);
+            luappToLua(L, entry->value);
+            lua_settable(L, -3);
+        }
+    }
+}
+
+/*
+ * Convert Lua++ class to Lua table with constructor.
+ * 
+ * Lua++ class becomes:
+ * {
+ *   __luapp_class = <userdata>,
+ *   __name = "ClassName",
+ *   new = function(...) ... end,
+ *   <methods...>
+ * }
+ */
+static void classToLua(lua_State* L, ObjClass* klass) {
+    lua_newtable(L);
+    
+    /* Store class name */
+    lua_pushstring(L, "__name");
+    lua_pushlstring(L, klass->name->chars, klass->name->length);
+    lua_settable(L, -3);
+    
+    /* Store reference to original class as light userdata */
+    lua_pushstring(L, "__luapp_class");
+    lua_pushlightuserdata(L, klass);
+    lua_settable(L, -3);
+    
+    /* Copy methods as Lua functions */
+    for (int i = 0; i < klass->methods.capacity; i++) {
+        Entry* entry = &klass->methods.entries[i];
+        if (entry->key != NULL) {
+            lua_pushlstring(L, entry->key->chars, entry->key->length);
+            luappToLua(L, entry->value);
+            lua_settable(L, -3);
+        }
+    }
+}
+
+/*
+ * Convert Lua++ instance to Lua table.
+ * 
+ * Instance becomes:
+ * {
+ *   __luapp_instance = <userdata>,
+ *   __class = <class table>,
+ *   <fields...>
+ * }
+ * With metatable pointing to class methods.
+ */
+static void instanceToLua(lua_State* L, ObjInstance* instance) {
+    lua_newtable(L);
+    
+    /* Store reference to original instance */
+    lua_pushstring(L, "__luapp_instance");
+    lua_pushlightuserdata(L, instance);
+    lua_settable(L, -3);
+    
+    /* Copy fields */
+    for (int i = 0; i < instance->fields.capacity; i++) {
+        Entry* entry = &instance->fields.entries[i];
+        if (entry->key != NULL) {
+            lua_pushlstring(L, entry->key->chars, entry->key->length);
+            luappToLua(L, entry->value);
+            lua_settable(L, -3);
+        }
+    }
+    
+    /* Create metatable with __index pointing to class methods */
+    lua_newtable(L);  /* metatable */
+    lua_pushstring(L, "__index");
+    classToLua(L, instance->klass);
+    lua_settable(L, -3);
+    lua_setmetatable(L, -2);
+}
+
+
+/*
+ * Wrapper for calling Lua++ closures from Lua.
+ * The closure is stored as upvalue[1].
+ */
+static int luappClosureWrapper(lua_State* L) {
+    /* Get the Lua++ closure from upvalue */
+    ObjClosure* closure = (ObjClosure*)lua_touserdata(L, lua_upvalueindex(1));
+    if (closure == NULL) {
+        return luaL_error(L, "Invalid Lua++ closure");
+    }
+    
+    int argCount = lua_gettop(L);
+    int expectedArgs = closure->function->arity;
+    
+    /* Check arity */
+    if (argCount != expectedArgs) {
+        return luaL_error(L, "Expected %d arguments but got %d",
+                          expectedArgs, argCount);
+    }
+    
+    /* Convert Lua arguments to Lua++ values */
+    Value* args = NULL;
+    if (argCount > 0) {
+        args = (Value*)malloc(sizeof(Value) * argCount);
+        if (args == NULL) {
+            return luaL_error(L, "Out of memory");
+        }
+        for (int i = 0; i < argCount; i++) {
+            args[i] = luaToLuapp(L, i + 1);  /* Lua indices are 1-based */
+        }
+    }
+    
+    /* Call the Lua++ function */
+    Value result = NIL_VAL;
+    bool success = callClosure(closure, argCount, args, &result);
+    
+    /* Free argument array */
+    if (args != NULL) {
+        free(args);
+    }
+    
+    if (!success) {
+        return luaL_error(L, "Lua++ function call failed");
+    }
+    
+    /* Convert result back to Lua */
+    luappToLua(L, result);
+    return 1;
+}
+
+/*
+ * Convert Lua++ closure to Lua function.
+ */
+static void closureToLua(lua_State* L, ObjClosure* closure) {
+    /* Store closure pointer as light userdata upvalue */
+    lua_pushlightuserdata(L, closure);
+    lua_pushcclosure(L, luappClosureWrapper, 1);
+}
+
+/* ========== Lua → Lua++ Value ========== */
+
+Value luaToLuapp(lua_State* L, int idx) {
+    /* Handle negative indices */
+    if (idx < 0 && idx > LUA_REGISTRYINDEX) {
+        idx = lua_gettop(L) + idx + 1;
+    }
+    
+    switch (lua_type(L, idx)) {
+        case LUA_TNIL:
+            return NIL_VAL;
+            
+        case LUA_TBOOLEAN:
+            return BOOL_VAL(lua_toboolean(L, idx));
+            
+        case LUA_TNUMBER:
+            return NUMBER_VAL(lua_tonumber(L, idx));
+            
+        case LUA_TSTRING: {
+            size_t len;
+            const char* s = lua_tolstring(L, idx, &len);
+            return OBJ_VAL(copyString(s, (int)len));
+        }
+        
+        case LUA_TTABLE:
+            return tableFromLua(L, idx);
+            
+        case LUA_TFUNCTION:
+            /* TODO: Wrap Lua functions as Lua++ natives */
+            return NIL_VAL;
+            
+        case LUA_TUSERDATA:
+        case LUA_TLIGHTUSERDATA:
+            /* Check if it's a wrapped Lua++ object */
+            return NIL_VAL;
+            
+        default:
+            return NIL_VAL;
+    }
+}
+
+/*
+ * Convert Lua table to Lua++ table.
+ */
+static Value tableFromLua(lua_State* L, int idx) {
+    ObjTable* table = newTable();
+    push(OBJ_VAL(table));  /* GC protection */
+    
+    lua_pushnil(L);  /* First key */
+    while (lua_next(L, idx) != 0) {
+        /* Key at -2, value at -1 */
+        
+        if (lua_isinteger(L, -2)) {
+            /* Integer key → array part */
+            int key = (int)lua_tointeger(L, -2);
+            if (key >= 1) {
+                Value val = luaToLuapp(L, -1);
+                /* Grow array if needed */
+                while (table->array.count < key) {
+                    writeValueArray(&table->array, NIL_VAL);
+                }
+                table->array.values[key - 1] = val;
+            }
+        }
+        else if (lua_isstring(L, -2)) {
+            /* String key → hash part */
+            size_t len;
+            const char* key = lua_tolstring(L, -2, &len);
+            ObjString* keyStr = copyString(key, (int)len);
+            Value val = luaToLuapp(L, -1);
+            tableSet(&table->entries, keyStr, val);
+        }
+        
+        lua_pop(L, 1);  /* Pop value, keep key for next iteration */
+    }
+    
+    pop();  /* Remove GC protection */
+    return OBJ_VAL(table);
+}
+
+/* ========== Lua API Functions ========== */
+
+/*
+ * luapp.eval(code) - Evaluate Lua++ code string
+ * Returns the result or nil on error.
+ */
+static int l_eval(lua_State* L) {
+    const char* code = luaL_checkstring(L, 1);
+    
+    if (!vmInitialized) {
+        initVM();
+        vmInitialized = true;
+    }
+    
+    InterpretResult result = interpret(code);
+    
+    if (result != INTERPRET_OK) {
+        lua_pushnil(L);
+        lua_pushstring(L, result == INTERPRET_COMPILE_ERROR ? 
+                       "Compile error" : "Runtime error");
+        return 2;
+    }
+    
+    /* Get result from Lua++ stack if any */
+    /* Note: Current VM doesn't expose results easily */
+    lua_pushnil(L);
+    return 1;
+}
+
+/*
+ * luapp.load(filename) - Load and execute a Lua++ file
+ * Returns a table with exported globals.
+ */
+static int l_load(lua_State* L) {
+    const char* filename = luaL_checkstring(L, 1);
+    
+    /* Read file */
+    FILE* file = fopen(filename, "rb");
+    if (file == NULL) {
+        return luaL_error(L, "Cannot open file: %s", filename);
+    }
+    
+    fseek(file, 0L, SEEK_END);
+    size_t fileSize = ftell(file);
+    rewind(file);
+    
+    char* buffer = (char*)malloc(fileSize + 1);
+    if (buffer == NULL) {
+        fclose(file);
+        return luaL_error(L, "Not enough memory to read file");
+    }
+    
+    size_t bytesRead = fread(buffer, sizeof(char), fileSize, file);
+    buffer[bytesRead] = '\0';
+    fclose(file);
+    
+    /* Initialize VM if needed */
+    if (!vmInitialized) {
+        initVM();
+        vmInitialized = true;
+    }
+    
+    /* Compile and run */
+    InterpretResult result = interpretWithFilename(buffer, filename);
+    free(buffer);
+    
+    if (result != INTERPRET_OK) {
+        return luaL_error(L, "Failed to load %s: %s", filename,
+                          result == INTERPRET_COMPILE_ERROR ? 
+                          "compile error" : "runtime error");
+    }
+    
+    /* Export globals as Lua table */
+    lua_newtable(L);
+    
+    /* Iterate through Lua++ globals and convert to Lua */
+    for (int i = 0; i < vm.globals.capacity; i++) {
+        Entry* entry = &vm.globals.entries[i];
+        if (entry->key != NULL) {
+            /* Skip built-in functions */
+            const char* name = entry->key->chars;
+            if (strcmp(name, "print") == 0 ||
+                strcmp(name, "read") == 0 ||
+                strcmp(name, "type") == 0 ||
+                strcmp(name, "tonumber") == 0 ||
+                strcmp(name, "tostring") == 0) {
+                continue;
+            }
+            
+            lua_pushlstring(L, entry->key->chars, entry->key->length);
+            luappToLua(L, entry->value);
+            lua_settable(L, -3);
+        }
+    }
+    
+    return 1;
+}
+
+/*
+ * luapp.version() - Get Lua++ version string
+ */
+static int l_version(lua_State* L) {
+    lua_pushstring(L, "Lua++ 0.1.0");
+    return 1;
+}
+
+/*
+ * luapp.reset() - Reset the Lua++ VM state
+ */
+static int l_reset(lua_State* L) {
+    (void)L;
+    if (vmInitialized) {
+        freeVM();
+        initVM();
+    }
+    return 0;
+}
+
+/* ========== Module Registration ========== */
+
+static const luaL_Reg luapp_funcs[] = {
+    {"eval",    l_eval},
+    {"load",    l_load},
+    {"version", l_version},
+    {"reset",   l_reset},
+    {NULL, NULL}
+};
+
+int luaopen_luapp(lua_State* L) {
+    /* Initialize Lua++ VM */
+    if (!vmInitialized) {
+        initVM();
+        vmInitialized = true;
+    }
+    
+    /* Create module table */
+    luaL_newlib(L, luapp_funcs);
+    
+    /* Add version info */
+    lua_pushstring(L, "0.1.0");
+    lua_setfield(L, -2, "_VERSION");
+    
+    return 1;
+}

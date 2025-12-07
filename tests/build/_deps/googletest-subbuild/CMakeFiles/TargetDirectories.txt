@@ -1,0 +1,3 @@
+/Users/alexanderbrianttadiosa/TERMUX TOOLS/luaOOP/lua-plus-plus/tests/build/_deps/googletest-subbuild/CMakeFiles/googletest-populate.dir
+/Users/alexanderbrianttadiosa/TERMUX TOOLS/luaOOP/lua-plus-plus/tests/build/_deps/googletest-subbuild/CMakeFiles/edit_cache.dir
+/Users/alexanderbrianttadiosa/TERMUX TOOLS/luaOOP/lua-plus-plus/tests/build/_deps/googletest-subbuild/CMakeFiles/rebuild_cache.dir
